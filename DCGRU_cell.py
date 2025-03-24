@@ -1,394 +1,274 @@
-#!/usr/bin/env python3
-
-
 import numpy as np
+import utils
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
-
-##########################################################
-#                   DiffusionGraphConv
-##########################################################
+from scipy.sparse import coo_matrix
 
 class DiffusionGraphConv(nn.Module):
-    """
-    Diffusion graph convolution operator with Chebyshev-like polynomial.
-    Optionally: 'laplacian' => Chebyshev recursion,
-                'dual_random_walk' => 2 directed RW supports, etc.
-    """
-
-    def __init__(
-            self,
-            num_supports: int,
-            input_dim: int,
-            hidden_dim: int,
-            num_nodes: int,
-            max_diffusion_step: int,
-            output_dim: int,
-            bias_start: float = 0.0,
-            filter_type: str = 'laplacian',
-    ):
+    def __init__(self, num_supports, input_dim, hid_dim, num_nodes,
+                 max_diffusion_step, output_dim, bias_start=0.0,
+                 filter_type='laplacian'):
         """
+        Diffusion graph convolution
         Args:
-            num_supports: number of support matrices (1 for 'laplacian',
-                          2 for 'dual_random_walk')
-            input_dim: input feature dimension (per node)
-            hidden_dim: dimension of hidden state (per node)
-            num_nodes: number of nodes in the graph
-            max_diffusion_step: K (the order of the Chebyshev or # of hops)
-            output_dim: dimension of the output (per node)
-            bias_start: initial bias
-            filter_type: 'laplacian' or 'dual_random_walk'
+            num_supports: number of supports, 1 for 'laplacian' filter and 2
+                for 'dual_random_walk'
+            input_dim: input feature dim
+            hid_dim: hidden units
+            num_nodes: number of nodes in graph
+            max_diffusion_step: maximum diffusion step
+            output_dim: output feature dim
+            filter_type: 'laplacian' for undirected graph, and 'dual_random_walk'
+                for directed graph
         """
-        super().__init__()
-        self.num_supports = num_supports
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.num_nodes = num_nodes
-        self.max_diffusion_step = max_diffusion_step
-        self.filter_type = filter_type
-
-        # We do a conv on the concatenation of (X, H) => input_dim + hidden_dim
-        # Then for each support and each diffusion step, we get another copy of the features.
-        self._input_size = self.input_dim + self.hidden_dim
-
-        # total # of “transformed” feature copies
-        num_matrices = self.num_supports * self.max_diffusion_step + 1
-
-        # Define weight and bias
+        super(DiffusionGraphConv, self).__init__()
+        num_matrices = num_supports * max_diffusion_step + 1
+        self._input_size = input_dim + hid_dim
+        self._num_nodes = num_nodes
+        self._max_diffusion_step = max_diffusion_step
+        self._filter_type = filter_type
         self.weight = nn.Parameter(
-            torch.FloatTensor(self._input_size * num_matrices, output_dim)
-        )
-        self.bias = nn.Parameter(torch.FloatTensor(output_dim))
+            torch.FloatTensor(
+                size=(
+                    self._input_size *
+                    num_matrices,
+                    output_dim)))
+        self.biases = nn.Parameter(torch.FloatTensor(size=(output_dim,)))
+        nn.init.xavier_normal_(self.weight.data, gain=1.414)
+        nn.init.constant_(self.biases.data, val=bias_start)
 
-        # Initialize
-        nn.init.xavier_normal_(self.weight, gain=1.414)
-        nn.init.constant_(self.bias, bias_start)
+    @staticmethod
+    def _concat(x, x_):
+        x_ = torch.unsqueeze(x_, 1)
+        return torch.cat([x, x_], dim=1)
 
-    def forward(self, inputs_and_state: torch.Tensor, support_list: list):
+    @staticmethod
+    def _build_sparse_matrix(L):
         """
-        inputs_and_state: shape (B, num_nodes, input_dim + hidden_dim)
-        support_list: a list of adjacency-like matrices (PyTorch Tensors)
-                      either of shape (num_nodes, num_nodes) or (B, num_nodes, num_nodes)
-                      depending on whether it is dynamic or static adjacency.
-                      Typically (num_nodes, num_nodes) for static graphs.
-        Returns:
-            Tensor of shape (B, num_nodes, output_dim)
+        build pytorch sparse tensor from scipy sparse matrix
+        reference: https://stackoverflow.com/questions/50665141
         """
-        b, n, in_feats = inputs_and_state.shape
-        assert n == self.num_nodes
-        assert in_feats == self._input_size
+        shape = L.shape
+        i = torch.LongTensor(np.vstack((L.row, L.col)).astype(int))
+        v = torch.FloatTensor(L.data)
+        return torch.sparse.FloatTensor(i, v, torch.Size(shape))
 
-        # x0: (B, num_nodes, input_size)
-        x0 = inputs_and_state
-        x_stack = [x0]  # identity (0th order)
+    def forward(self, supports, inputs, state, output_size, bias_start=0.0):
+        # Reshape input and state to (batch_size, num_nodes,
+        # input_dim/hidden_dim)
+        batch_size = inputs.shape[0]
+        inputs = torch.reshape(inputs, (batch_size, self._num_nodes, -1))
+        state = torch.reshape(state, (batch_size, self._num_nodes, -1))
+        # (batch, num_nodes, input_dim+hidden_dim)
+        inputs_and_state = torch.cat([inputs, state], dim=2)
+        input_size = self._input_size
 
-        # For each support in the list, apply Chebyshev recursion
-        if self.max_diffusion_step > 0:
-            for support in support_list:
-                # x1 = support * x0  ( shape: (B, num_nodes, input_size) )
-                # If support is static [n, n], then we do:
-                x1 = torch.einsum('ij,bjk->bik', support, x0)
-                # Add x1 to the stack
-                x_stack.append(x1)
-                # Keep track of x1,x0 for Chebyshev recursion
-                x_prev, x_curr = x0, x1
-                # Recursion for k=2..K
-                for k in range(2, self.max_diffusion_step + 1):
-                    x2 = 2 * torch.einsum('ij,bjk->bik', support, x_curr) - x_prev
-                    x_stack.append(x2)
-                    x_prev, x_curr = x_curr, x2
+        x0 = inputs_and_state  # (batch, num_nodes, input_dim+hidden_dim)
+        # (batch, 1, num_nodes, input_dim+hidden_dim)
+        x = torch.unsqueeze(x0, dim=1)
 
-        # Now we have 1 + num_supports * max_diffusion_step “feature sets”
-        # Concatenate them along the last dimension
-        # x_stack => list of (B, num_nodes, input_size) with length “num_matrices”
-        x_cat = torch.cat(x_stack, dim=-1)  # shape: (B, num_nodes, input_size * num_matrices)
+        if self._max_diffusion_step == 0:
+            pass
+        else:
+            for support in supports:
+                x1 = torch.stack([
+                    torch.sparse.mm(support, x0[b]) for b in range(batch_size)
+                ], dim=0)
+                x = self._concat(x, x1)
 
-        # Perform the linear transform
-        # -> (B*num_nodes, input_size * num_matrices) @ (input_size * num_matrices, out_dim)
-        b_n = b * n
-        x_reshape = x_cat.view(b_n, -1)  # flatten
-        out = x_reshape @ self.weight + self.bias  # => (B*n, out_dim)
-        out = out.view(b, n, -1)  # => (B, num_nodes, out_dim)
-        return out
+                xk_minus_two = x0
+                xk_minus_one = x1
 
+                for k in range(2, self._max_diffusion_step + 1):
+                    x2 = torch.stack([
+                        2 * torch.sparse.mm(support, xk_minus_one[b]) - xk_minus_two[b]
+                        for b in range(batch_size)
+                    ], dim=0)
+                    x = self._concat(x, x2)
+                    xk_minus_two, xk_minus_one = xk_minus_one, x2
 
-##########################################################
-#                   DCGRUCell
-##########################################################
+        num_matrices = len(supports) * \
+            self._max_diffusion_step + 1  # Adds for x itself
+        # (batch, num_nodes, num_matrices, input_hidden_size)
+        x = torch.transpose(x, dim0=1, dim1=2)
+        # (batch, num_nodes, input_hidden_size, num_matrices)
+        x = torch.transpose(x, dim0=2, dim1=3)
+        x = torch.reshape(
+            x,
+            shape=[
+                batch_size,
+                self._num_nodes,
+                input_size *
+                num_matrices])
+        x = torch.reshape(
+            x,
+            shape=[
+                batch_size *
+                self._num_nodes,
+                input_size *
+                num_matrices])
+        # (batch_size * self._num_nodes, output_size)
+        x = torch.matmul(x, self.weight)
+        x = torch.add(x, self.biases)
+        return torch.reshape(x, [batch_size, self._num_nodes * output_size])
+
 
 class DCGRUCell(nn.Module):
     """
-    Diffusion Convolutional Gated Recurrent Unit Cell
-    that uses DiffusionGraphConv for the gates.
+    Graph Convolution Gated Recurrent Unit Cell.
     """
 
     def __init__(
             self,
-            input_dim: int,
-            num_units: int,
-            max_diffusion_step: int,
-            num_nodes: int,
-            filter_type: str = "laplacian",
-            nonlinearity: str = "tanh",
-            use_gc_for_ru: bool = True,
-    ):
+            input_dim,
+            num_units,
+            max_diffusion_step,
+            num_nodes,
+            filter_type="laplacian",
+            nonlinearity='tanh',
+            use_gc_for_ru=True):
         """
         Args:
-            input_dim: Input feature dimension (per node)
-            num_units: # of DCGRU hidden units (per node)
-            max_diffusion_step: K (max Chebyshev order)
-            num_nodes: # of nodes in the graph
-            filter_type: 'laplacian' or 'dual_random_walk'
-            nonlinearity: 'tanh' or 'relu' for candidate activation
-            use_gc_for_ru: If True, use graph convolution for R/U gates
-                           else uses a dense linear transform.
+            input_dim: input feature dim
+            num_units: number of DCGRU hidden units
+            max_diffusion_step: maximum diffusion step
+            num_nodes: number of nodes in the graph
+            filter_type: 'laplacian' for undirected graph, 'dual_random_walk' for directed graph
+            nonlinearity: 'tanh' or 'relu'. Default is 'tanh'
+            use_gc_for_ru: decide whether to use graph convolution inside rnn. Default True
         """
-        super().__init__()
-        self.num_nodes = num_nodes
-        self.num_units = num_units
-        self.max_diffusion_step = max_diffusion_step
-        self.use_gc_for_ru = use_gc_for_ru
-
-        if nonlinearity == "tanh":
-            self.act = torch.tanh
-        elif nonlinearity == "relu":
-            self.act = F.relu
+        super(DCGRUCell, self).__init__()
+        self._activation = torch.tanh if nonlinearity == 'tanh' else torch.relu
+        self._num_nodes = num_nodes
+        self._num_units = num_units
+        self._max_diffusion_step = max_diffusion_step
+        self._use_gc_for_ru = use_gc_for_ru
+        if filter_type == "laplacian":  # ChebNet graph conv
+            self._num_supports = 1
+        elif filter_type == "random_walk":  # Forward random walk
+            self._num_supports = 1
+        elif filter_type == "dual_random_walk":  # Bidirectional random walk
+            self._num_supports = 2
         else:
-            raise ValueError("Unknown nonlinearity.")
+            self._num_supports = 1
 
-        # Determine how many supports
-        if filter_type == "laplacian":
-            self.num_supports = 1
-        elif filter_type == "random_walk":
-            self.num_supports = 1
-        elif filter_type == "dual_random_walk":
-            self.num_supports = 2
-        else:
-            self.num_supports = 1
-
-        # Gate Convolution: output 2 * num_units for [r, u]
-        if self.use_gc_for_ru:
-            self.gate_conv = DiffusionGraphConv(
-                num_supports=self.num_supports,
-                input_dim=input_dim,
-                hidden_dim=num_units,
-                num_nodes=num_nodes,
-                max_diffusion_step=max_diffusion_step,
-                output_dim=num_units * 2,
-                filter_type=filter_type,
-                bias_start=1.0,  # per original code
-            )
-        else:
-            # If not using graph conv for RU gates, use a dense layer
-            in_channels = (input_dim + num_units)
-            self.fc_gate = nn.Linear(in_channels, 2 * num_units, bias=True)
-            nn.init.constant_(self.fc_gate.bias, 1.0)
-
-        # Candidate Convolution
-        self.candidate_conv = DiffusionGraphConv(
-            num_supports=self.num_supports,
+        self.dconv_gate = DiffusionGraphConv(
+            num_supports=self._num_supports,
             input_dim=input_dim,
-            hidden_dim=num_units,
+            hid_dim=num_units,
+            num_nodes=num_nodes,
+            max_diffusion_step=max_diffusion_step,
+            output_dim=num_units * 2,
+            filter_type=filter_type)
+        self.dconv_candidate = DiffusionGraphConv(
+            num_supports=self._num_supports,
+            input_dim=input_dim,
+            hid_dim=num_units,
             num_nodes=num_nodes,
             max_diffusion_step=max_diffusion_step,
             output_dim=num_units,
-            filter_type=filter_type,
-        )
-
-    def forward(self, x: torch.Tensor, h: torch.Tensor, support_list: list):
-        """
-        Single time-step forward.
-        Args:
-            x: (B, num_nodes, input_dim)
-            h: (B, num_nodes, num_units)  -- hidden state
-            support_list: list of adjacency-like Tensors, shape (num_nodes, num_nodes)
-                          or (B, num_nodes, num_nodes) for each support
-        Returns:
-            h_new: (B, num_nodes, num_units)
-        """
-        # r,u Gate
-        if self.use_gc_for_ru:
-            # Combine x,h => shape (B, num_nodes, in_dim + num_units)
-            in_and_h = torch.cat([x, h], dim=-1)
-            gates = self.gate_conv(in_and_h, support_list)  # (B, num_nodes, 2*num_units)
-        else:
-            # Dense version
-            in_and_h = torch.cat([x, h], dim=-1)  # (B, num_nodes, in_dim+num_units)
-            # Flatten last dim and do fc -> reshape
-            B, N, _ = in_and_h.shape
-            gates = self.fc_gate(in_and_h.view(B * N, -1))
-            gates = gates.view(B, N, -1)  # (B, num_nodes, 2*num_units)
-
-        r, u = torch.split(gates, self.num_units, dim=-1)
-        r, u = torch.sigmoid(r), torch.sigmoid(u)
-
-        # Candidate
-        candidate_in = torch.cat([x, r * h], dim=-1)
-        c = self.candidate_conv(candidate_in, support_list)  # (B, num_nodes, num_units)
-        c = self.act(c)
-
-        # New hidden state
-        h_new = u * h + (1.0 - u) * c
-        return h_new
+            filter_type=filter_type)
 
     @property
     def output_size(self):
-        return self.num_nodes * self.num_units
+        output_size = self._num_nodes * self._num_units
+        return output_size
 
-    def init_hidden(self, batch_size: int) -> torch.Tensor:
-        """Return zeros for initial hidden state."""
-        return torch.zeros(batch_size, self.num_nodes, self.num_units, dtype=torch.float32)
+    def forward(self, supports, inputs, state):
+        """
+        Args:
+            inputs: (B, num_nodes * input_dim)
+            state: (B, num_nodes * num_units)
+        Returns:
+            output: (B, num_nodes * output_dim)
+            state: (B, num_nodes * num_units)
+        """
+        output_size = 2 * self._num_units
+        if self._use_gc_for_ru:
+            fn = self.dconv_gate
+        else:
+            fn = self._fc
+        value = torch.sigmoid(
+            fn(supports, inputs, state, output_size, bias_start=1.0))
+        value = torch.reshape(value, (-1, self._num_nodes, output_size))
+        r, u = torch.split(
+            value, split_size_or_sections=int(
+                output_size / 2), dim=-1)
+        r = torch.reshape(r, (-1, self._num_nodes * self._num_units))
+        u = torch.reshape(u, (-1, self._num_nodes * self._num_units))
+        # batch_size, self._num_nodes * output_size
+        c = self.dconv_candidate(supports, inputs, r * state, self._num_units)
+        if self._activation is not None:
+            c = self._activation(c)
+        output = new_state = u * state + (1 - u) * c
 
+        return output, new_state
 
-##########################################################
-#                     TESTING
-##########################################################
+    @staticmethod
+    def _concat(x, x_):
+        x_ = torch.unsqueeze(x_, 0)
+        return torch.cat([x, x_], dim=0)
 
-def main_test():
-    # Suppose we have a directed graph with 5 nodes:
-    num_nodes = 5
-    # Build an adjacency (random for demonstration).
-    np.random.seed(42)
-    adj = np.random.rand(num_nodes, num_nodes)
-    adj[adj < 0.7] = 0.0
+    def _gconv(self, supports, inputs, state, output_size, bias_start=0.0):
+        pass
 
-    # Create 'dual_random_walk' support:
-    # e.g., forward random walk, backward random walk
-    def calc_rw(adj_mx):
-        d = adj_mx.sum(axis=1)
-        d_inv = np.where(d == 0, 0, 1 / d)
-        return (np.diag(d_inv) @ adj_mx).astype(np.float32)
+    def _fc(self, supports, inputs, state, output_size, bias_start=0.0):
+        pass
 
-    forward_rw = torch.from_numpy(calc_rw(adj)).float()
-    backward_rw = torch.from_numpy(calc_rw(adj.T)).float()
-
-    support_list = [forward_rw, backward_rw]  # shape (5,5) each
-
-    # Build a DCGRUCell
-    cell = DCGRUCell(
-        input_dim=16,
-        num_units=8,
-        max_diffusion_step=2,
-        num_nodes=num_nodes,
-        filter_type='dual_random_walk',
-        nonlinearity='tanh',
-        use_gc_for_ru=True,
-    )
-
-    # Batch of 4, each with (num_nodes=5, input_dim=16)
-    x = torch.randn(4, num_nodes, 16)
-    h = cell.init_hidden(batch_size=4)
-
-    h_next = cell(x, h, support_list)  # single step
-    print("Input shape: ", x.shape)
-    print("Hidden shape (prev): ", h.shape)
-    print("Hidden shape (new):  ", h_next.shape)
+    def init_hidden(self, batch_size):
+        # state: (B, num_nodes * num_units)
+        return torch.zeros(batch_size, self._num_nodes * self._num_units)
 
 
-def generate_synthetic_eeg_data(batch_size, num_nodes, input_dim, seq_len):
-    """
-    Generate synthetic EEG data with normal and seizure-like activity.
-    Args:
-        batch_size: Number of samples in the batch.
-        num_nodes: Number of electrodes (nodes in the graph).
-        input_dim: Feature dimension per node (e.g., frequency bands).
-        seq_len: Length of the time series.
-    Returns:
-        Tensor of shape (batch_size, seq_len, num_nodes, input_dim)
-    """
-    data = []
-    for _ in range(batch_size):
-        sample = []
-        for t in range(seq_len):
-            if t < seq_len // 2:  # Normal activity
-                signal = np.random.normal(loc=0, scale=0.1, size=(num_nodes, input_dim))
-            else:  # Seizure activity
-                signal = np.random.normal(loc=1, scale=0.5, size=(num_nodes, input_dim))
-            sample.append(signal)
-        data.append(np.array(sample))
-    return torch.tensor(np.array(data), dtype=torch.float32)
+def create_support_matrix(num_nodes):
+    # Simple undirected graph (ring structure)
+    adj = np.zeros((num_nodes, num_nodes))
+    for i in range(num_nodes):
+        adj[i, (i + 1) % num_nodes] = 1
+        adj[(i + 1) % num_nodes, i] = 1
+
+    # Normalize adjacency matrix (symmetric normalized Laplacian approximation)
+    D_inv_sqrt = np.diag(1.0 / np.sqrt(adj.sum(axis=1) + 1e-5))
+    laplacian = D_inv_sqrt @ adj @ D_inv_sqrt
+    support = coo_matrix(laplacian)
+
+    i = torch.LongTensor(np.vstack((support.row, support.col)))
+    v = torch.FloatTensor(support.data)
+    return torch.sparse.FloatTensor(i, v, torch.Size(support.shape))
 
 
-def create_graph_adjacency(num_nodes):
-    """
-    Create a random adjacency matrix for the graph.
-    Args:
-        num_nodes: Number of nodes in the graph.
-    Returns:
-        Adjacency matrix (torch.Tensor) of shape (num_nodes, num_nodes).
-    """
-    adj = np.random.rand(num_nodes, num_nodes)
-    adj[adj < 0.7] = 0.0  # Sparse graph
-    np.fill_diagonal(adj, 0)  # No self-loops
-    return torch.tensor(adj, dtype=torch.float32)
-
-
-def calc_rw(adj_mx):
-    """
-    Compute random walk transition matrix from adjacency matrix.
-    """
-    d = adj_mx.sum(dim=1)  # Sum along rows (degree of each node)
-    d_inv = torch.where(d == 0, torch.tensor(0.0), 1.0 / d)  # Avoid division by zero
-    # Compute D^-1 @ A (random walk transition matrix)
-    return torch.diag(d_inv) @ adj_mx
-
-
-def main_test_seizure_detection():
-    # Parameters
-    batch_size = 4
-    num_nodes = 5  # Number of electrodes
-    input_dim = 16  # Feature dimension (e.g., frequency bands)
-    hidden_dim = 8  # Hidden state dimension
-    seq_len = 20  # Time steps
+def test_dcgru_cell():
+    num_nodes = 4
+    input_dim = 2
+    hidden_units = 3
+    batch_size = 2
     max_diffusion_step = 2
-    filter_type = "dual_random_walk"
 
-    # Generate synthetic EEG data
-    eeg_data = generate_synthetic_eeg_data(batch_size, num_nodes, input_dim, seq_len)
-    print("EEG Data Shape:", eeg_data.shape)  # (batch_size, seq_len, num_nodes, input_dim)
+    # Create a support matrix for testing (Laplacian-based)
+    support = create_support_matrix(num_nodes)
+    supports = [support]  # list of supports
 
-    # Create graph adjacency matrix and support list
-    adj = create_graph_adjacency(num_nodes)
-    forward_rw = calc_rw(adj)
-    backward_rw = calc_rw(adj.T)
-    support_list = [forward_rw, backward_rw]
+    # Create toy input and hidden state
+    inputs = torch.rand(batch_size, num_nodes * input_dim)
+    state = torch.zeros(batch_size, num_nodes * hidden_units)
 
-    # Build DCGRUCell
-    cell = DCGRUCell(
+    # Instantiate DCGRUCell
+    dcgru_cell = DCGRUCell(
         input_dim=input_dim,
-        num_units=hidden_dim,
+        num_units=hidden_units,
         max_diffusion_step=max_diffusion_step,
         num_nodes=num_nodes,
-        filter_type=filter_type,
-        nonlinearity="tanh",
-        use_gc_for_ru=True,
+        filter_type="laplacian",  # or "dual_random_walk"
+        nonlinearity='tanh',
+        use_gc_for_ru=True
     )
 
-    # Initialize hidden state
-    h = cell.init_hidden(batch_size=batch_size)
+    # Run forward pass
+    output, new_state = dcgru_cell(supports, inputs, state)
 
-    # Process each time step
-    outputs = []
-    for t in range(seq_len):
-        x_t = eeg_data[:, t, :, :]  # Shape: (batch_size, num_nodes, input_dim)
-        h = cell(x_t, h, support_list)
-        outputs.append(h)
-
-    # Stack outputs over time
-    outputs = torch.stack(outputs, dim=1)  # Shape: (batch_size, seq_len, num_nodes, hidden_dim)
-    print("Output Shape:", outputs.shape)
-
-    # Example: Predict seizure likelihood
-    classifier = nn.Linear(hidden_dim, 1)  # Binary classification (seizure vs normal)
-    predictions = torch.sigmoid(classifier(outputs))  # Shape: (batch_size, seq_len, num_nodes, 1)
-    print("Predictions Shape:", predictions.shape)
-
-    # Print example predictions for the first sample
-    print("Example Predictions (First Sample):")
-    print(predictions[0, :, :, 0].detach().numpy())
+    print("Output shape:", output.shape)
+    print("New state shape:", new_state.shape)
+    print("Output sample:\n", output)
 
 
-if __name__ == "__main__":
-    main_test_seizure_detection()
+test_dcgru_cell()
