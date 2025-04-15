@@ -1,6 +1,6 @@
 --------------------IF YOU ALREADY HAVE FILEMARKERS UNDER DataExtract, SKIP TO CHECKPOINT 1----------------------------
 
-Once v2.0.3 is on the server, run the following form outside v2.0.3, and ensure that their are test, dev and eval subdirectories: 
+Once v2.0.3 is on the server, run the following from outside v2.0.3, and ensure that their are test, dev and eval subdirectories: 
 
 python extractor3.py
 python extractor4.py
