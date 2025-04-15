@@ -1,0 +1,44 @@
+--------------------IF YOU ALREADY HAVE FILEMARKERS UNDER DataExtract, SKIP TO CHECKPOINT 1----------------------------
+
+Once v2.0.3 is on the server, run the following form outside v2.0.3, and ensure that their are test, dev and eval subdirectories: 
+
+python extractor3.py
+python extractor4.py
+
+This should generate something called extracted_data_detailed.csv. Then run the following from the same directory in which the aforementioned CSV is stored:
+
+python binary_labeller.py
+python classification_labeler.py
+
+This will output 2 csv's, called binary_classification_labelled.csv and classification_labelled2.csv
+
+Then, change the files called markers.py and markers_classification,py so that the process_csv methods and process_seizure_csv are called with the directory of binary_classification_labelled.csv and classification_labelled2.csv respectively + your desired output directory. For example, in markers.py, 
+
+process_csv("/local/home/nnvo/EECS 6322 - Project/DataExtract/binary_classification_labelled.csv", "/local/home/nnvo/EECS 6322 - Project/DataExtract") 
+
+and in markers_classification,
+
+process_seizure_csv("/local/home/nnvo/EECS 6322 - Project/DataExtract/Extracted_CSVs/classification_labelled_data2.csv", "/local/home/nnvo/EECS 6322 - Project/DataExtract/Filemarkers_classification").
+
+Once this change is made, run the following:
+
+python markers.py
+python marker_classification.py 
+
+This will produce the Filemarkers_detection and Filemarkers_classification folders. 
+
+------------------------CHECKPOINT 1: FILE MARKERS COMPLETE------------------------------------
+
+Once you have file markers, you can run this to resample the signals: 
+
+python ./data/resample_signals.py --raw_edf_dir <tusz-data-dir> --save_dir <resampled-dir>
+
+Once this is complete, you can run the last steps. But you may need to make the following adjustments:
+change the FILE_MARKER_DIR constant in the preprocess_detection.py and preprocess_classification.py files so that is points to your file markers of detection and classification folders, respectively. Then, change the all_tuples variable to train_tuples, dev_tuples or test_tuples depending on which type of data you are dealing with, for each of the preprocessors.
+ ex). all_tuples = train_tuples is used when the input and output directories refer to training data.
+
+python ./DataExtract/preprocess_detection.py --resampled_dir <resampled-dir> --raw_data_dir <tusz-data-dir> --output_dir <preproc-dir> --clip_len <clip-len> --time_step_size 1 --is_fft
+
+python ./DataExtract/preprocess_classification.py --resampled_dir <resampled-dir> --raw_data_dir <tusz-data-dir> --output_dir <preproc-dir> --clip_len <clip-len> --time_step_size 1 --is_fft
+
+Note that the input, resampled and output directories should all correspond to the same type, i.e. eval, dev or training data as necessary and should match the value used for all_tuples. Once these steps are completed, there should be clips stored in the output directory(s) specified. Warnings may be thrown at some steps of the process, and many will take a long time due to the amount of data. 
